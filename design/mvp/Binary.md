@@ -186,7 +186,9 @@ defvaltype    ::= pvt:<primvaltype>                       => pvt
                 | 0x72 lt*:vec(<labelvaltype>)            => (record (field lt)*)    (if |lt*| > 0)
                 | 0x71 case*:vec(<case>)                  => (variant case+) (if |case*| > 0)
                 | 0x70 t:<valtype>                        => (list t)
-                | 0x67 t:<valtype> len:<u32>              => (list t len) 🔧
+                | 0x67 0x00 t:<valtype> len:<u32>         => (list t (eq len)) 🔧
+                | 0x67 0x01 t:<valtype> maxlen:<u32>      => (list t (le len)) 🔧
+                | 0x67 0x02 maxlen:<u32>                  => (string (le len)) 🔧
                 | 0x6f t*:vec(<valtype>)                  => (tuple t+)    (if |t*| > 0)
                 | 0x6e l*:vec(<label'>)                   => (flags l+)    (if 0 < |l*| <= 32)
                 | 0x6d l*:vec(<label'>)                   => (enum l+)     (if |l*| > 0)

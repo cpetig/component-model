@@ -108,6 +108,8 @@ test(Record([Field('x',U8()), Field('y',U16()), Field('z',U32())]), [1,2,3], {'x
 test(Tuple([Tuple([U8(),U8()]),U8()]), [1,2,3], {'0':{'0':1,'1':2},'1':3})
 test(List(U8(),3), [1,2,3], [1,2,3])
 test(List(List(U8(),2),3), [1,2,3,4,5,6], [[1,2],[3,4],[5,6]])
+test(List(String(4), 2, True), [2, 3,65,66,67,0, 2,49,50,0,0], ['ABC', '12'])
+test(List(String(4), 2, True), [1, 3,65,66,67,0, 0,0,0,0,0], ['ABC'])
 # Empty flags types are not permitted yet.
 #t = Flags([])
 #test(t, [], {})

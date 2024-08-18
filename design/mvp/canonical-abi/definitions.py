@@ -112,12 +112,16 @@ class U64(ValType): pass
 class F32(ValType): pass
 class F64(ValType): pass
 class Char(ValType): pass
-class String(ValType): pass
+
+@dataclass
+class String(ValType): 
+  maxlen: Optional[int] = None
 
 @dataclass
 class List(ValType):
   t: ValType
   l: Optional[int] = None
+  var: Optional[bool] = False
 
 @dataclass
 class Field:
@@ -189,15 +193,17 @@ def alignment(t):
     case F32()              : return 4
     case F64()              : return 8
     case Char()             : return 4
-    case String()           : return 4
-    case List(t, l)         : return alignment_list(t, l)
+    case String(maxlen)     : return alignment_string(maxlen)
+    case List(t, l, var)    : return alignment_list(t, l, var)
     case Record(fields)     : return alignment_record(fields)
     case Variant(cases)     : return alignment_variant(cases)
     case Flags(labels)      : return alignment_flags(labels)
     case Own(_) | Borrow(_) : return 4
 
-def alignment_list(elem_type, maybe_length):
+def alignment_list(elem_type, maybe_length, maybe_variable):
   if maybe_length is not None:
+    if maybe_variable is not None and maybe_variable:
+      return max(alignment(varint_type(maybe_length)), alignment(elem_type))
     return alignment(elem_type)
   return 4
 
@@ -212,12 +218,40 @@ def alignment_variant(cases):
 
 def discriminant_type(cases):
   n = len(cases)
-  assert(0 < n < (1 << 32))
-  match math.ceil(math.log2(n)/8):
+  return varint_type(n)
+
+def varint_type(maxval):
+  assert(0 < maxval < (1 << 32))
+  match math.ceil(math.log2(maxval)/8):
     case 0: return U8()
     case 1: return U8()
     case 2: return U16()
     case 3: return U32()
+
+def string_character_size(encoding):
+  match encoding:
+    case 'utf8':
+      return 1
+    case _:
+      return 2
+
+def string_length_type(encoding, maxlength):
+  match encoding:
+    case 'utf8':
+      return varint_type(maxlength)
+    case 'utf16':
+      return varint_type(maxlength)
+    case 'latin1+utf16':
+      # highest bit of length encodes utf16,
+      # utf8 enables double amount of characters,
+      # so multiply by four
+      return varint_type(maxlength * 4)
+
+def alignment_string(maybe_maxlen):
+  if maybe_maxlen is not None:
+    encoding = 'utf8'
+    return max(alignment(string_length_type(encoding, maybe_maxlen)), string_character_size(encoding))
+  return 4
 
 def max_case_alignment(cases):
   a = 1
@@ -245,15 +279,19 @@ def elem_size(t):
     case F32()              : return 4
     case F64()              : return 8
     case Char()             : return 4
-    case String()           : return 8
-    case List(t, l)         : return elem_size_list(t, l)
+    case String(maxlen)     : return elem_size_string(maxlen)
+    case List(t, l, var)    : return elem_size_list(t, l, var)
     case Record(fields)     : return elem_size_record(fields)
     case Variant(cases)     : return elem_size_variant(cases)
     case Flags(labels)      : return elem_size_flags(labels)
     case Own(_) | Borrow(_) : return 4
 
-def elem_size_list(elem_type, maybe_length):
+def elem_size_list(elem_type, maybe_length, maybe_variable):
   if maybe_length is not None:
+    if maybe_variable is not None and maybe_variable:
+      s = elem_size(varint_type(maybe_length))
+      s = align_to(s, alignment(elem_type))
+      return s + maybe_length * elem_size(elem_type)
     return maybe_length * elem_size(elem_type)
   return 8
 
@@ -284,6 +322,15 @@ def elem_size_flags(labels):
   if n <= 8: return 1
   if n <= 16: return 2
   return 4
+
+def elem_size_string(maybe_maxlen):
+  if maybe_maxlen is not None:
+    encoding = 'utf8'
+    align = string_character_size(encoding)
+    s = elem_size(string_length_type(encoding, maybe_maxlen))
+    s = align_to(s, align)
+    return s + maybe_maxlen * align
+  return 8
 
 ### Call Context
 
@@ -1185,8 +1232,8 @@ def lift_flat(cx, vi, t):
     case F32()          : return canonicalize_nan32(vi.next('f32'))
     case F64()          : return canonicalize_nan64(vi.next('f64'))
     case Char()         : return convert_i32_to_char(cx, vi.next('i32'))
-    case String()       : return lift_flat_string(cx, vi)
-    case List(t, l)     : return lift_flat_list(cx, vi, t, l)
+    case String(maxlen) : return lift_flat_string(cx, vi, maxlen)
+    case List(t, l, var): return lift_flat_list(cx, vi, t, l, var)
     case Record(fields) : return lift_flat_record(cx, vi, fields)
     case Variant(cases) : return lift_flat_variant(cx, vi, cases)
     case Flags(labels)  : return lift_flat_flags(vi, labels)
@@ -1206,16 +1253,70 @@ def lift_flat_signed(vi, core_width, t_width):
     return i - (1 << t_width)
   return i
 
-def lift_flat_string(cx, vi):
+def lift_flat_ignore(cx, vi, t):
+  match despecialize(t):
+    case Bool()         : vi.next('i32')
+    case U8()           : vi.next('i32')
+    case U16()          : vi.next('i32')
+    case U32()          : vi.next('i32')
+    case U64()          : vi.next('i64')
+    case S8()           : vi.next('i32')
+    case S16()          : vi.next('i32')
+    case S32()          : vi.next('i32')
+    case S64()          : vi.next('i64')
+    case F32()          : vi.next('f32')
+    case F64()          : vi.next('f64')
+    case Char()         : vi.next('i32')
+    case String(maxlen) : lift_flat_string_ignore(vi, maxlen)
+    case List(t, l, var): trap()
+    case Record(fields) : trap()
+    case Variant(cases) : trap()
+    case Flags(labels)  : trap()
+    case Own()          : vi.next('i32')
+    case Borrow()       : vi.next('i32')
+
+def lift_flat_string_ignore(vi, maxlen):
+  if maxlen is not None:
+    vi.next('i32')
+    for i in range(maxlen):
+      vi.next('i32')
+
+def lift_flat_chars(cx, vi, len):
+  res = b""
+  match cx.opts.string_encoding:
+    case 'utf8':
+      for i in range(len):
+        byte = lift_flat_unsigned(vi, 32, 8).to_bytes(1)
+        res += byte
+      return res.decode('utf-8')
+    case _: trap()
+
+def lift_flat_string(cx, vi, maybe_maxlen):
+  if maybe_maxlen is not None:
+    lentype = string_length_type(cx.opts.string_encoding, maybe_maxlen)
+    len = lift_flat(cx, vi, lentype)
+    chartype = string_character_size(cx.opts.string_encoding)
+    res = lift_flat_chars(cx, vi, len)
+    for i in range(maybe_maxlen - len):
+      vi.next('i32')
+    return res
   ptr = vi.next('i32')
   packed_length = vi.next('i32')
   return load_string_from_range(cx, ptr, packed_length)
 
-def lift_flat_list(cx, vi, elem_type, maybe_length):
+def lift_flat_list(cx, vi, elem_type, maybe_length, maybe_variable):
   if maybe_length is not None:
     a = []
-    for i in range(maybe_length):
+    len = maybe_length
+    if maybe_variable is not None and maybe_variable:
+      lentype = varint_type(maybe_length)
+      len = lift_flat(cx, vi, lentype)
+    for i in range(len):
       a.append(lift_flat(cx, vi, elem_type))
+    if maybe_variable is not None and maybe_variable:
+      # skip unused storage
+      for i in range((maybe_length-len)):
+        lift_flat_ignore(cx, vi, elem_type)
     return a
   ptr = vi.next('i32')
   length = vi.next('i32')
@@ -1276,25 +1377,69 @@ def lower_flat(cx, v, t):
     case F32()          : return [maybe_scramble_nan32(v)]
     case F64()          : return [maybe_scramble_nan64(v)]
     case Char()         : return [char_to_i32(v)]
-    case String()       : return lower_flat_string(cx, v)
-    case List(t, l)     : return lower_flat_list(cx, v, t, l)
+    case String(maxlen) : return lower_flat_string(cx, v, maxlen)
+    case List(t, l, var): return lower_flat_list(cx, v, t, l, var)
     case Record(fields) : return lower_flat_record(cx, v, fields)
     case Variant(cases) : return lower_flat_variant(cx, v, cases)
     case Flags(labels)  : return lower_flat_flags(v, labels)
     case Own()          : return [lower_own(cx, v, t)]
     case Borrow()       : return [lower_borrow(cx, v, t)]
 
+def lower_flat_zero(cx, t):
+  match despecialize(t):
+    case Bool()         : return [0]
+    case U8()           : return [0]
+    case U16()          : return [0]
+    case U32()          : return [0]
+    case U64()          : return [0]
+    case S8()           : return [0]
+    case S16()          : return [0]
+    case S32()          : return [0]
+    case S64()          : return [0]
+    case F32()          : return [0]
+    case F64()          : return [0]
+    case Char()         : return [0]
+    case String(maxlen) : return lower_flat_zero_string(maxlen)
+    case List(t, l, var): trap()
+    case Record(fields) : trap()
+    case Variant(cases) : trap()
+    case Flags(labels)  : trap()
+    case Own()          : return [0]
+    case Borrow()       : return [0]
+
+def lower_flat_zero_string(maxlen):
+  result = [0]
+  for i in range(maxlen):
+    result.append(0)
+  return result
+
 def lower_flat_signed(i, core_bits):
   if i < 0:
     i += (1 << core_bits)
   return [i]
 
-def lower_flat_string(cx, v):
+def lower_flat_string(cx, v, maybe_maxlen):
+  if maybe_maxlen is not None:
+    encoded = v.encode('utf-8')
+    result = [ len(encoded) ]
+    for i in encoded:
+      result.append(i)
+    for i in range(maybe_maxlen-len(encoded)):
+      result.append(0)
+    return result
   ptr, packed_length = store_string_into_range(cx, v)
   return [ptr, packed_length]
 
-def lower_flat_list(cx, v, elem_type, maybe_length):
+def lower_flat_list(cx, v, elem_type, maybe_length, maybe_variable):
   if maybe_length is not None:
+    if maybe_variable is not None and maybe_variable:
+      assert(maybe_length >= len(v))
+      flat = [len(v)]
+      for e in v:
+        flat += lower_flat(cx, e, elem_type)
+      for i in range(maybe_length - len(v)):
+        flat += lower_flat_zero(cx, elem_type)
+      return flat
     assert(maybe_length == len(v))
     flat = []
     for e in v:
